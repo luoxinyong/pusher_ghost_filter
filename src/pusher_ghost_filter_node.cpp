@@ -256,8 +256,8 @@ private:
       return;
     }
     frames_.push_back(Frame{cloud, pose});
-    RCLCPP_INFO(get_logger(), "Stored keyframe %zu (%zu points)",
-                frames_.size() - 1U, cloud->size());
+    RCLCPP_DEBUG(get_logger(), "Stored keyframe %zu (%zu points)",
+                 frames_.size() - 1U, cloud->size());
   }
 
   static bool prepareOutputPath(const std::string &path) {
@@ -305,16 +305,26 @@ private:
           }
         }
       }
-      Cloud transformed;
-      pcl::transformPointCloud(kept_body, transformed,
-                               frame.pose.matrix().cast<float>());
-      *kept += transformed;
-      pcl::transformPointCloud(removed_body, transformed,
-                               frame.pose.matrix().cast<float>());
-      *removed += transformed;
-      pcl::transformPointCloud(protected_body, transformed,
-                               frame.pose.matrix().cast<float>());
-      *protected_points += transformed;
+      // PCL 1.12 divides by the input cloud width while assigning an empty
+      // transform result. Avoid passing empty candidate branches to it.
+      if (!kept_body.empty()) {
+        Cloud transformed;
+        pcl::transformPointCloud(kept_body, transformed,
+                                 frame.pose.matrix().cast<float>());
+        *kept += transformed;
+      }
+      if (!removed_body.empty()) {
+        Cloud transformed;
+        pcl::transformPointCloud(removed_body, transformed,
+                                 frame.pose.matrix().cast<float>());
+        *removed += transformed;
+      }
+      if (!protected_body.empty()) {
+        Cloud transformed;
+        pcl::transformPointCloud(protected_body, transformed,
+                                 frame.pose.matrix().cast<float>());
+        *protected_points += transformed;
+      }
     }
 
     kept = globalDownsample(kept, map_voxel_size_);
