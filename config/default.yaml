@@ -1,0 +1,39 @@
+/**:
+  ros__parameters:
+    # Input cloud must be expressed in the moving body/LiDAR frame. The odometry
+    # pose must transform that frame into a fixed map/odom frame.
+    cloud_topic: /cloud_registered_body
+    odom_topic: /Odometry
+
+    keyframe_translation: 0.5
+    keyframe_rotation_deg: 10.0
+    keyframe_voxel_size: 0.20
+    map_voxel_size: 0.08
+
+    map_output_path: /tmp/pusher_ghost_filter/cleaned_map.pcd
+    removed_output_path: /tmp/pusher_ghost_filter/removed_candidates.pcd
+    protected_output_path: /tmp/pusher_ghost_filter/static_protected_candidates.pcd
+
+    filter:
+      voxel_size: 0.20
+      min_radius: 0.25
+      max_radius: 3.0
+      window_size_frames: 60
+      window_stride_frames: 30
+      min_keyframe_ratio: 0.12
+      min_support_frames: 8
+      pose_cell_size: 2.0
+      min_pose_cells: 4
+      yaw_bins: 12
+      min_yaw_bins: 1
+      ground_exclusion_half_height: 0.25
+      min_component_voxels: 4
+      max_component_voxels: 3000
+      min_component_height: 0.50
+      max_component_height: 2.80
+      max_component_width: 1.80
+      static_map_voxel_size: 0.30
+      static_min_support_frames: 3
+      static_pose_cell_size: 1.0
+      static_min_pose_cells: 2
+      static_min_body_voxels: 3
