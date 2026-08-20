@@ -32,6 +32,8 @@ namespace pusher_ghost_filter {
 
 namespace {
 
+// 将 nav_msgs/Odometry 中的位置和四元数转换为 Eigen 刚体变换。
+// 返回的 pose 约定为“移动点云坐标系 -> 固定 map/odom 坐标系”。
 Eigen::Isometry3d poseFromMessage(const nav_msgs::msg::Odometry &message) {
   const auto &position = message.pose.pose.position;
   const auto &orientation = message.pose.pose.orientation;
@@ -49,6 +51,8 @@ double rotationAngle(const Eigen::Matrix3d &rotation) {
   return Eigen::AngleAxisd(rotation).angle();
 }
 
+// 下面的 VoxelKey/Accumulator 只服务于最终地图的全局体素降采样，
+// 与核心算法中的 BodyVoxelKey（人体检测体素）是两套独立用途的数据结构。
 struct VoxelKey {
   std::int64_t x = 0;
   std::int64_t y = 0;
@@ -90,6 +94,7 @@ public:
 
   PusherGhostFilterNode()
       : Node("pusher_ghost_filter"), filter_(loadFilterConfig()) {
+    // 点云必须在移动的车体/雷达坐标系；里程计 pose 必须能把它变到固定系。
     cloud_topic_ =
         declare_parameter<std::string>("cloud_topic", "/cloud_registered_body");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/Odometry");
@@ -110,6 +115,8 @@ public:
         "protected_output_path",
         "/tmp/pusher_ghost_filter/static_protected_candidates.pcd");
 
+    // 使用 ApproximateTime 把时间最接近的点云与位姿配成一帧。
+    // 若两者时间戳长期错位，静态墙也会在地图系漂移，静态保护就会失效。
     const auto input_qos =
         rclcpp::QoS(rclcpp::KeepLast(100)).reliable().get_rmw_qos_profile();
     cloud_subscriber_.subscribe(this, cloud_topic_, input_qos);
@@ -133,6 +140,8 @@ public:
   }
 
 private:
+  // ROS 参数集中转换成与 ROS 无关的算法配置。核心库只接收这个结构体，
+  // 因此既可以由独立节点使用，也可以嵌入其他 SLAM/回环程序。
   BodyFixedGhostFilterConfig loadFilterConfig() {
     BodyFixedGhostFilterConfig config;
     config.voxel_size = declare_parameter<double>("filter.voxel_size", 0.20);
@@ -180,12 +189,14 @@ private:
     if (frames_.empty()) {
       return true;
     }
+    // 当前位姿相对“上一已保存关键帧”的变化，而不是相对上一条里程计消息。
     const Eigen::Isometry3d delta = frames_.back().pose.inverse() * pose;
     return delta.translation().norm() >= keyframe_translation_ ||
            rotationAngle(delta.rotation()) >= keyframe_rotation_;
   }
 
   Cloud::Ptr downsample(const Cloud::Ptr &input, double leaf_size) const {
+    // NaN 不仅会污染体素索引，也会破坏后面的坐标变换，先统一去除。
     Cloud::Ptr finite(new Cloud);
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*input, *finite, indices);
@@ -193,6 +204,7 @@ private:
       return finite;
     }
     Cloud::Ptr output(new Cloud);
+    // 关键帧降采样用于降低时序统计的内存和计算量；点仍保留在车体系。
     pcl::VoxelGrid<Point> voxel_filter;
     voxel_filter.setLeafSize(leaf_size, leaf_size, leaf_size);
     voxel_filter.setInputCloud(finite);
@@ -204,6 +216,8 @@ private:
     if (leaf_size <= 0.0) {
       return input;
     }
+    // 所有关键帧已经变换并拼接到地图系。这里对全局体素中的坐标和强度
+    // 求平均，避免同一面墙因多次观测而产生过高点密度。
     std::unordered_map<VoxelKey, VoxelAccumulator, VoxelKeyHash> voxels;
     voxels.reserve(input->size());
     const double inverse = 1.0 / leaf_size;
@@ -243,8 +257,10 @@ private:
   void measurementCallback(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_message,
       const nav_msgs::msg::Odometry::ConstSharedPtr &odometry) {
+    // 此回调收到的是同步后的“一帧车体系点云 + 对应地图位姿”。
     const Eigen::Isometry3d pose = poseFromMessage(*odometry);
     std::lock_guard<std::mutex> lock(mutex_);
+    // 不保存车辆几乎没动时的重复帧，否则出现帧数统计会被停车时段支配。
     if (!isKeyframe(pose)) {
       return;
     }
@@ -255,6 +271,7 @@ private:
     if (cloud->empty()) {
       return;
     }
+    // 这里只缓存数据，不实时删除点。完整时序收集结束后由 save 服务统一分析。
     frames_.push_back(Frame{cloud, pose});
     RCLCPP_DEBUG(get_logger(), "Stored keyframe %zu (%zu points)",
                  frames_.size() - 1U, cloud->size());
@@ -273,6 +290,7 @@ private:
 
   void save(const std_srvs::srv::Trigger::Request::ConstSharedPtr,
             std_srvs::srv::Trigger::Response::SharedPtr response) {
+    // 保存期间锁住关键帧数组，避免 detect() 分析时又插入新帧。
     std::lock_guard<std::mutex> lock(mutex_);
     if (frames_.empty()) {
       response->success = false;
@@ -280,6 +298,7 @@ private:
       return;
     }
 
+    // 第一遍：只学习每帧人体遮罩和地图系静态保护证据，不修改原始点云。
     const BodyFixedGhostFilter::Result detection = filter_.detect(frames_);
     Cloud::Ptr kept(new Cloud);
     Cloud::Ptr removed(new Cloud);
@@ -291,6 +310,8 @@ private:
       Cloud removed_body;
       Cloud protected_body;
       for (const auto &point : frame.cloud->points) {
+        // 第二遍逐点执行最终逻辑：
+        //   删除 = 当前帧人体候选 && 没有地图系静态保护。
         const bool candidate =
             filter_.isBodyCandidate(point, frame_index, detection);
         const bool static_protected =
@@ -299,6 +320,8 @@ private:
         if (candidate && !static_protected) {
           removed_body.push_back(point);
         } else {
+          // 普通点和受保护的候选点都进入 cleaned；受保护候选还会额外导出，
+          // 方便目视检查墙、柱和货架腿是否曾差点被误删。
           kept_body.push_back(point);
           if (static_protected) {
             protected_body.push_back(point);
@@ -307,6 +330,7 @@ private:
       }
       // PCL 1.12 divides by the input cloud width while assigning an empty
       // transform result. Avoid passing empty candidate branches to it.
+      // 上述分类仍发生在车体系。导出前分别乘当前帧位姿，统一到地图系。
       if (!kept_body.empty()) {
         Cloud transformed;
         pcl::transformPointCloud(kept_body, transformed,
@@ -327,6 +351,7 @@ private:
       }
     }
 
+    // 最终三层地图分别体素化，原始输入和缓存关键帧不会被覆盖。
     kept = globalDownsample(kept, map_voxel_size_);
     removed = globalDownsample(removed, map_voxel_size_);
     protected_points = globalDownsample(protected_points, map_voxel_size_);
@@ -357,6 +382,7 @@ private:
   void reset(const std_srvs::srv::Trigger::Request::ConstSharedPtr,
              std_srvs::srv::Trigger::Response::SharedPtr response) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // 回放下一组 bag 前必须清空，否则两组轨迹会被当成一个时序共同学习。
     const std::size_t count = frames_.size();
     frames_.clear();
     response->success = true;
@@ -387,6 +413,7 @@ private:
 } // namespace pusher_ghost_filter
 
 int main(int argc, char **argv) {
+  // ROS 2 入口：构造节点后持续处理同步订阅、save 和 reset 服务。
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<pusher_ghost_filter::PusherGhostFilterNode>());
   rclcpp::shutdown();
